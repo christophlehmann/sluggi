@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Wazum\Sluggi\Backend\Service;
 
+use Doctrine\DBAL\Connection;
 use Exception;
 use PDO;
 use TYPO3\CMS\Backend\Utility\BackendUtility;
@@ -17,6 +18,7 @@ use TYPO3\CMS\Core\Routing\InvalidRouteArgumentsException;
 use TYPO3\CMS\Core\Routing\PageRouter;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Redirects\Service\RedirectCacheService;
+use Wazum\Sluggi\Helper\PermissionHelper;
 use function rtrim;
 
 /**
@@ -109,6 +111,58 @@ class SlugService extends \TYPO3\CMS\Redirects\Service\SlugService
                 );
             }
         }
+    }
+
+    /**
+     * Patch: This function is copied from parent class
+     *
+     * Here PermissionHelper::isLocked() is used to not update slugs of pages having tx_sluggi_locked=1
+     */
+    protected function resolveSubPages(int $id, int $languageUid): array
+    {
+        // First resolve all sub-pages in default language
+        $queryBuilder = $this->getQueryBuilderForPages();
+        $subPages = $queryBuilder
+            ->select('*')
+            ->from('pages')
+            ->where(
+                $queryBuilder->expr()->eq('pid', $queryBuilder->createNamedParameter($id, \PDO::PARAM_INT)),
+                $queryBuilder->expr()->eq('sys_language_uid', $queryBuilder->createNamedParameter(0, \PDO::PARAM_INT))
+            )
+            ->orderBy('uid', 'ASC')
+            ->execute()
+            ->fetchAll();
+
+        // if the language is not the default language, resolve the language related records.
+        if ($languageUid > 0) {
+            $queryBuilder = $this->getQueryBuilderForPages();
+            $subPages = $queryBuilder
+                ->select('*')
+                ->from('pages')
+                ->where(
+                    $queryBuilder->expr()->in('l10n_parent', $queryBuilder->createNamedParameter(array_column($subPages, 'uid'), Connection::PARAM_INT_ARRAY)),
+                    $queryBuilder->expr()->eq('sys_language_uid', $queryBuilder->createNamedParameter($languageUid, \PDO::PARAM_INT))
+                )
+                ->orderBy('uid', 'ASC')
+                ->execute()
+                ->fetchAll();
+        }
+        $results = [];
+        if (!empty($subPages)) {
+            $subPages = $this->pageRepository->getPagesOverlay($subPages, $languageUid);
+            foreach ($subPages as $subPage) {
+                if (PermissionHelper::isLocked($subPage)) {
+                    continue;
+                }
+                $results[] = $subPage;
+                // resolveSubPages needs the page id of the default language
+                $pageId = $languageUid === 0 ? (int)$subPage['uid'] : (int)$subPage['l10n_parent'];
+                foreach ($this->resolveSubPages($pageId, $languageUid) as $page) {
+                    $results[] = $page;
+                }
+            }
+        }
+        return $results;
     }
 
     protected function createRedirectWithPageId(
